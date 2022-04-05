@@ -1,0 +1,680 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Lab template
+
+# Lab VPC with 2 public + 2 private subnets (RDS requires 2 AZs)
+# DB Subnet Group across the 2 private subnets
+# Role for EC2 instance to access Parameter Store
+# Lambda function to clear existing Parameter Store parameters
+
+Parameters:
+  LatestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: String
+
+Resources:
+  ###########
+  # VPC with Internet Gateway
+  ###########
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Lab IGW
+
+  VPCtoIGWConnection:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn:
+      - IGW
+      - VPC
+    Properties:
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC
+
+  ###########
+  # Public Route Table
+  ###########
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn:
+      - PublicRouteTable
+      - VPCtoIGWConnection
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+      RouteTableId: !Ref PublicRouteTable
+
+  ###########
+  # Private Route Table
+  ###########
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private Route Table
+
+  ###########
+  # Public Subnets x 2
+  ###########
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Public Subnet 1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Public Subnet 2
+
+  PublicRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - PublicRouteTable
+      - PublicSubnet1
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - PublicRouteTable
+      - PublicSubnet2
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  ###########
+  # Private Subnets x 2
+  ###########
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/23
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Private Subnet 1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/23
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Private Subnet 2
+
+  PrivateRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - PrivateRouteTable
+      - PrivateSubnet1
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - PrivateRouteTable
+      - PrivateSubnet2
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  ###########
+  # IAM Role for App
+  ###########
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref AppRole]
+      InstanceProfileName: Inventory-App-Role
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Inventory-App-Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ssm:*
+                Resource: "arn:aws:ssm:*:*:parameter/inventory-app/*"
+
+  ###########
+  # DB Subnet Group
+  ###########
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Lab-DB-Subnet-Group
+      DBSubnetGroupName: Lab-DB-Subnet-Group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: DBSubnetGroup
+
+  ###########
+  # Security Group App-SG
+  ###########
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App-SG
+      GroupName: App-SG
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+      VpcId: !Ref VPC
+
+  ###########
+  # Security Group DB-SG
+  ###########
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB-SG
+      GroupName: DB-SG
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref AppSecurityGroup
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+      VpcId: !Ref VPC
+
+  ###########
+  # EC2 App Server
+  ###########
+
+  EC2AppServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: Inventory-App-Role
+      InstanceType: t2.micro
+      KeyName: !Ref "KeyName"
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      SubnetId: !Ref PublicSubnet1
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Install Apache Web Server and PHP
+          yum install -y httpd mysql
+          amazon-linux-extras install -y php7.2
+          # Download Lab files
+          wget https://aws-tc-largeobjects.s3-us-west-2.amazonaws.com/ILT-TF-200-ACACAD-20-EN/mod5-guided/scripts/inventory-app.zip
+          unzip inventory-app.zip -d /var/www/html/
+          # Download and install the AWS SDK for PHP
+          wget https://github.com/aws/aws-sdk-php/releases/download/3.62.3/aws.zip
+          unzip aws -d /var/www/html
+          # Turn on web server
+          chkconfig httpd on
+          service httpd start
+      Tags:
+        - Key: Name
+          Value: App Server
+
+  ###########
+  # Lambda function to clear existing Parameter Store parameters
+  ###########
+
+  LambdaClearParameters:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: clears the parameter store
+      FunctionName: Clear-parameter-store
+      Role: !Sub ${LambdaVPCRole.Arn}
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import threading
+          import cfnresponse
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          def handler(event, context):
+              # Send a failure to CloudFormation if the function timesout
+              timer = threading.Timer((context.get_remaining_time_in_millis()
+                      / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              
+              try:
+                  # Loop through regions
+                  ec2 = boto3.client('ec2')
+                  regions = ['us-east-1','us-west-2']
+                  for region in regions:
+
+                      # SSM Client
+                      ssm = boto3.client('ssm', region_name=region)
+
+                      # Get all Parameter Store parameters for region
+                      get_region_params = ssm.describe_parameters()
+                      names = [p['Name'] for p in get_region_params['Parameters']]
+                      print(region, names)
+
+                      # Delete them
+                      if len(names) > 0:
+                          del_region_params = ssm.delete_parameters(Names=names)
+                      else:
+                          print(('No parameters to delete in region ' + region))
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Resource creation successful!"}, None)
+              except:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": "Problem deleting parameters!"}, None)
+
+          def timeout(event, context):
+              logging.error("Execution is about to time out, sending failure response to CloudFormation")
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+      Handler: index.handler
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 300
+
+  CustomClearParameters:
+    Type: "Custom::CustomClearParameters"
+    Properties:
+      ServiceToken: !Sub ${LambdaClearParameters.Arn}
+
+  LambdaVPCRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: SSMCleanup
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:*
+                  - ec2:Describe*
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ###########
+  # awsstudent user & policy for Cloud9 in Vocareum
+  ###########
+  IAMUser:
+    Type: "AWS::IAM::User"
+    Properties:
+      UserName: awsstudent
+
+  IAMPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    DependsOn: IAMUser
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          [
+            {
+              "Sid": "StudentPolicy",
+              "Action":
+                [
+                  "cloudformation:*",
+                  "cloud9:*",
+                  "iam:Get*",
+                  "iam:List*",
+                  "iam:CreateServiceLinkedRole",
+                  "iam:PassRole",
+                  "kms:List*",
+                  "kms:Describe*",
+                  "logs:List*",
+                  "logs:Describe*",
+                  "logs:Get*",
+                  "logs:StartQuery",
+                  "logs:StopQuery",
+                  "logs:TestMetricFilter",
+                  "logs:FilterLogEvents",
+                  "lambda:*",
+                  "ec2:*Address*",
+                  "ec2:Cancel*",
+                  "ec2:Describe*",
+                  "ec2:*Gateway",
+                  "ec2:Get*",
+                  "ec2:*Image*",
+                  "ec2:*Network*",
+                  "ec2:*Route*",
+                  "ec2:*SecurityGroup*",
+                  "ec2:*Snapshot*",
+                  "ec2:*Subnet*",
+                  "ec2:*Vpc*",
+                  "ec2:*Vpn*",
+                  "ec2:DeleteFleets",
+                  "ec2:ResetEbsDefaultKmsKeyId",
+                  "ec2:ReportInstanceStatus",
+                  "ec2:ImportKeyPair",
+                  "ec2:StopInstances",
+                  "ec2:ProvisionByoipCidr",
+                  "ec2:WithdrawByoipCidr",
+                  "ec2:AssociateDhcpOptions",
+                  "ec2:ConfirmProductInstance",
+                  "ec2:ConfirmProductInstance",
+                  "ec2:ModifyFpgaImageAttribute",
+                  "ec2:EnableEbsEncryptionByDefault",
+                  "ec2:SendDiagnosticInterrupt",
+                  "ec2:AssociateIamInstanceProfile",
+                  "ec2:ReplaceIamInstanceProfileAssociation",
+                  "ec2:CreateDhcpOptions",
+                  "ec2:DeleteDhcpOptions",
+                  "ec2:CreateKeyPair",
+                  "ec2:DeleteKeyPair",
+                  "ec2:BundleInstance",
+                  "ec2:CreateTags",
+                  "ec2:DisassociateIamInstanceProfile",
+                  "ec2:AttachVolume",
+                  "ec2:CreateInstanceExportTask",
+                  "ec2:MonitorInstances",
+                  "ec2:UnmonitorInstances",
+                  "ec2:DetachVolume",
+                  "ec2:DeleteVolume",
+                  "ec2:DeleteLaunchTemplate*",
+                  "ec2:CreateFlowLogs",
+                  "ec2:DeleteFlowLogs",
+                  "ec2:ModifyIdentityIdFormat",
+                  "ec2:ModifyIdFormat",
+                  "ec2:AdvertiseByoipCidr",
+                  "ec2:DeprovisionByoipCidr",
+                  "ec2:DeleteTags",
+                  "ec2:TerminateInstances",
+                  "ec2:DisableEbsEncryptionByDefault",
+                  "ec2:ModifyEbsDefaultKmsKeyId",
+                  "rds:Describe*",
+                  "rds:List*",
+                  "rds:Download*",
+                  "rds:Add*",
+                  "rds:RemoveTag*",
+                  "rds:RemoveSourceIdentifierFromSubscription",
+                  "rds:RemoveRoleFromDBInstance",
+                  "rds:AuthorizeDBSecurityGroupIngress",
+                  "rds:CreateDBInstance",
+                  "rds:CreateDBSubnetGroup",
+                  "rds:CreateOptionGroup",
+                  "rds:CreateDBParameterGroup",
+                  "rds:CreateDBSecurityGroup",
+                  "rds:CreateDBSnapshot",
+                  "rds:CreateEventSubscription",
+                  "rds:Delete*",
+                  "rds:ResetDBParameterGroup",
+                  "rds:CopyDBParameterGroup",
+                  "rds:ModifyDBParameterGroup",
+                  "rds:ModifyDBSnapshot",
+                  "rds:ModifyDBSnapshotAttribute",
+                  "rds:ModifyDBSubnetGroup",
+                  "rds:ModifyEventSubscription",
+                  "rds:ModifyOptionGroup",
+                  "rds:RevokeDBSecurityGroupIngress",
+                  "rds:StopDBInstance",
+                  "rds:CopyOptionGroup",
+                  "rds:RebootDBInstance",
+                  "rds:ApplyPendingMaintenanceAction",
+                  "cloudwatch:Describe*",
+                  "cloudwatch:Get*",
+                  "cloudwatch:List*",
+                  "ssm:List*",
+                  "ssm:Describe*",
+                  "ssm:Get*",
+                  "ssm:PutInventory",
+                  "ssm:PutComplianceItems",
+                  "ssm:PutConfigurePackageResult",
+                  "ssm:UpdateAssociationStatus",
+                  "ssm:UpdateInstanceAssociationStatus",
+                  "ssm:UpdateInstanceInformation",
+                  "ssm:CancelCommand",
+                  "ssm:SendCommand",
+                  "ssm:StartAutomationExecution",
+                  "ssm:StartSession",
+                  "ssm:TerminateSession",
+                  "ssm:ResumeSession",
+                  "ssm:DescribeSessions",
+                  "ssm:GetConnectionStatus",
+                  "s3:Put*",
+                  "s3:Get*",
+                  "s3:Create*",
+                  "s3:Replicate*",
+                  "s3:Delete*",
+                  "s3:*Bucket*",
+                  "s3:List*",
+                  "s3:*Job*",
+                  "s3:ReplicateTags",
+                  "s3:RestoreObject",
+                  "s3:AbortMultipartUpload",
+                ],
+              "Effect": "Allow",
+              "Resource": "*",
+            },
+            {
+              "Sid": "RestrictRDSActivity",
+              "Effect": "Allow",
+              "Action":
+                [
+                  "rds:CreateDBInstance",
+                  "rds:CreateDBInstanceReadReplica",
+                  "rds:StartDBInstance",
+                  "rds:ModifyDBInstance",
+                  "rds:RebootDBInstance",
+                  "rds:RestoreDBInstanceFromDBSnapshot",
+                  "rds:RestoreDBInstanceFromS3",
+                  "rds:RestoreDBInstanceToPointInTime",
+                  "rds:CreateDBCluster",
+                  "rds:StartDBCluster",
+                  "rds:ModifyDBCluster",
+                  "rds:CreateGlobalCluster",
+                  "rds:ModifyDBClusterEndpoint",
+                  "rds:ModifyGlobalCluster",
+                  "rds:RestoreDBClusterFromS3",
+                  "rds:RestoreDBClusterFromSnapshot",
+                  "rds:ModifyCurrentDBClusterCapacity",
+                  "rds:PromoteReadReplicaDBCluster",
+                ],
+              "Resource": "*",
+              "Condition":
+                {
+                  "ForAnyValue:StringLikeIfExists":
+                    {
+                      "rds:DatabaseEngine":
+                        [
+                          "aurora-mysql",
+                          "aurora-postgresql",
+                          "mysql",
+                          "postgres",
+                          "mariadb",
+                        ],
+                      "rds:DatabaseClass":
+                        ["*.nano", "*.micro", "*.small", "*.medium"],
+                    },
+                  "NumericLessThanIfExists": { "rds:StorageSize": "101" },
+                  "NumericEqualsIfExists": { "rds:Piops": "0" },
+                  "BoolIfExists": { "rds:MultiAz": [false] },
+                },
+            },
+            {
+              "Sid": "RestrictInstanceActions",
+              "Effect": "Allow",
+              "Action":
+                [
+                  "ec2:CreateVolume",
+                  "ec2:ModifyVolume",
+                  "ec2:ImportVolume",
+                  "ec2:ModifyVolumeAttribute",
+                  "ec2:ModifyFleet",
+                  "ec2:ImportSnapshot",
+                  "ec2:ResetInstanceAttribute",
+                  "ec2:CreateFleet",
+                  "ec2:CreateLaunchTemplateVersion",
+                  "ec2:EnableVolumeIO",
+                  "ec2:CreateLaunchTemplate",
+                  "ec2:ImportInstance",
+                  "ec2:ModifyInstanceCreditSpecification",
+                  "ec2:ModifyLaunchTemplate",
+                  "ec2:ModifyInstanceAttribute",
+                  "ec2:RebootInstances",
+                  "ec2:RunInstances",
+                  "ec2:StartInstances",
+                ],
+              "Resource": "*",
+              "Condition":
+                {
+                  "StringEqualsIfExists": { "ec2:Owner": "amazon" },
+                  "ForAllValues:StringLikeIfExists":
+                    {
+                      "ec2:InstanceType": ["*.nano", "*.micro", "*.small"],
+                      "ec2:Tenancy": "default",
+                    },
+                  "StringNotEqualsIfExists":
+                    { "ec2:PlacementGroupStrategy": "cluster" },
+                  "StringNotEqualsIgnoreCaseIfExists":
+                    { "ec2:VolumeType": ["io1", "st1"] },
+                  "NumericLessThanEqualsIfExists": { "ec2:VolumeSize": "51" },
+                },
+            },
+            {
+              "Sid": "RestrictActions",
+              "Effect": "Deny",
+              "Action":
+                [
+                  "ec2:*Spot*",
+                  "ec2:*ReservedInstances*",
+                  "ec2:*Scheduled*",
+                  "ec2:*Purchase*",
+                  "ec2:EnableFastSnapshotRestores",
+                  "rds:PurchaseReservedDBInstancesOffering",
+                ],
+              "Resource": "*",
+            },
+            {
+              "Sid": "RestrictCloud9",
+              "Effect": "Deny",
+              "Action":
+                ["cloud9:CreateEnvironmentEC2", "cloud9:UpdateEnvironment"],
+              "Resource": "*",
+              "Condition":
+                {
+                  "ForAnyValue:StringNotLikeIfExists":
+                    { "cloud9:InstanceType": ["*.nano", "*.micro", "*.small"] },
+                },
+            },
+          ]
+      ManagedPolicyName: lab_policy
+      Users:
+        - awsstudent
+
+  IAMUserAccessKey:
+    Type: "AWS::IAM::AccessKey"
+    DependsOn: IAMUser
+    Properties:
+      Status: Active
+      UserName: awsstudent
+
+############
+# Outputs
+############
+
+Outputs:
+  AccessKey:
+    Value:
+      Ref: IAMUserAccessKey
+
+  SecretKey:
+    Value:
+      "Fn::GetAtt":
+        - IAMUserAccessKey
+        - SecretAccessKey
