@@ -1,5 +1,6 @@
-
 #!/bin/bash
+
+
 # Install Apache Web Server and PHP
 yum install -y httpd mysql
 amazon-linux-extras install -y php7.2
